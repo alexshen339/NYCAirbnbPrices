@@ -1,0 +1,214 @@
+---
+title: "NYC Airbnb Price Predictions"
+author: "Alex Shen, Daniel Zhou"
+output:
+  pdf_document: default
+  html_document: default
+code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r loading_packages, include = FALSE, warning = FALSE}
+library(tidyverse)
+library(broom)
+library(patchwork)
+```
+
+
+## Reading and cleaning data
+
+Our data set was obtained from Kaggle, and contains information about Airbnb 
+listings for NYC in 2019. We want to see what factors can best predict the 
+price of an Airbnb listing in NYC by creating a linear regression model with 
+price as the response variable. The variables that could be used to create a 
+linear regression at first glance are price (presumably per day/night in 
+dollars), neighborhood_group (borough), neighborhood, latitude, longitude, 
+room_type (shared, private, or entire house/apartment), minimum_nights (minimum 
+nights required), number_of_reviews, last_review (date of last review), 
+reviews_per_month, calculated_host_listings_count (number of listings from the 
+same host), and availability_365 (number of days available).
+
+
+```{r data, warning = FALSE}
+AB <- read.csv("data/AB_NYC_2019.csv")
+AB <- AB %>% 
+  filter(price>0) %>% 
+  mutate(neighborhood_group = as.factor(neighbourhood_group),
+         neighbourhood = as.factor(neighbourhood),
+         room_type = as.factor(room_type)) %>% 
+  select(neighborhood_group, neighbourhood, latitude, longitude, room_type, 
+         price, minimum_nights, number_of_reviews, last_review, 
+         reviews_per_month, calculated_host_listings_count, availability_365)
+AB <- na.omit(AB)
+```
+
+After reading in the data, we do some cleaning necessary to conduct our linear 
+regression. We select the variables that would be useful in conducting 
+regression, make the necessary variables factor variables, and filter for 
+prices greater than 0, since having prices equal to 0 does not make much sense,
+and would break the code later on. 
+
+
+```{r price_dist, warning = FALSE}
+ggplot(data = AB, mapping = aes(x = price)) + 
+  geom_histogram(binwidth = 20, fill = "steelblue") +  xlim(0, 2500) +
+  labs(title = "Distribution of Price", x = "Price ($)", y = "Count")
+```
+
+Here we can see the distribution of price. As we can see, the vast majority of 
+prices are between 0 and 300 dollars, and the data is skewed right with what 
+looks like many outliers visually on the right tail. This makes sense for price 
+to be concentrated at such prices (what average people can afford) and have a 
+few outliers of super luxurious Airbnb's.
+
+
+
+```{r cleaning, warning = FALSE}
+AB_new <- AB %>% 
+  filter(price > quantile(AB$price,.25) - 1.5*IQR(AB$price) & 
+           price < 1.5*IQR(AB$price) + quantile(AB$price,.75)) %>% 
+  mutate(log_price = log(price))
+
+ggplot(data = AB_new, mapping = aes(x = price)) + 
+  geom_histogram(binwidth = 20, fill = "steelblue") +  xlim(0, 2500) + 
+  labs(title = "Distribution of Price Without Outliers", x = "Price ($)", 
+       y = "Count")
+
+```
+
+As a result, we eliminate price outliers from the data set. We also log 
+transformed price to prevent negative price predictions from our model (and to 
+help out the constant variance condition, discussed later). If we did not 
+filter for price is greater than 0, this would not be possible. 
+
+
+## Creating our Model
+
+First, we wanted to think about what interaction effects we should include in 
+our full model before being backwards selected. We thought that of all the 
+variables, there could be an interaction between minimum nights and room type, 
+so we decided to investigate.
+
+```{r interactions, message = FALSE, warning = FALSE}
+ggplot(data = AB_new, aes(x = minimum_nights, 
+                          y = log_price, color = room_type)) + geom_point() + 
+  geom_smooth(method = lm) + 
+  labs(title = "Minimum nights and log price relationship", 
+       subtitle = "Separated by room type", x = "Minimum Nights", 
+       y = "Log Price") + scale_color_manual(values = c("royalblue2", 
+                                                        "steelblue", 
+                                                        "darkblue"))
+```
+
+Looking at the graph, we can tell that based on the level of room type, the 
+relationship (slope) between minimum nights and log price changes. As a 
+result there is an interaction between room type and minimum nights, so we 
+will add this interaction effect to the full model.
+
+
+```{r full_model, warning = FALSE}
+int_only <- lm(log_price ~ 1, data = AB_new)
+full_model <- lm(log_price ~ neighborhood_group + minimum_nights + room_type + 
+                   number_of_reviews + reviews_per_month + 
+                   calculated_host_listings_count + availability_365 + 
+                   room_type*minimum_nights, data = AB_new)
+```
+
+
+```{r select_model, warning = FALSE}
+Selected_model <- step(full_model, scope = formula(int_only), 
+                       direction = "backward", trace = 0)
+tidy(Selected_model) %>%
+  knitr::kable(digits = 5)
+save(Selected_model, file="R/selected_model.Rdata")
+```
+
+We chose to use a backwards selection by AIC rather than BIC, because AIC 
+usually lends itself more towards prediction tasks, which is what we are trying 
+to do. We create our full model of all possible variables that we deem useful, 
+then remove each variable that minimizes AIC until it is no longer possible. 
+
+After looking at this model, we see that all of the coefficients have really 
+low p values except for neighborhood_group Staten Island and number_of_reviews. 
+Because neighborhood_group Staten Island is a level of the neighborhood_group, 
+it means that the price of Airbnb's in Staten Island is not significantly 
+different than those in the base group (Bronx). Because the coefficient is so 
+small and because it is a level of the larger neighborhood_group, we will keep 
+it in the model. For number_of_reviews, the p-value is pretty much equal to our
+chosen significance cutoff of 0.05, so we decide to keep it in the model. 
+
+One thing to note is that our model has a log transformed response variable. 
+So, an increase in one of the dependent variables (with a coefficient B) by 1 
+means that the predicted median price will be multiplied by a factor of e^B. 
+
+Next, we will check conditions. 
+
+## Conditions
+
+```{r std resid plot, warning = FALSE}
+AB_aug <- augment(Selected_model) %>%
+   mutate(obs_num = row_number()) 
+
+ggplot(data = AB_aug, mapping = aes(x = .fitted, y = .std.resid)) + 
+  geom_point(color = "steelblue") +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "Standardized Residual Plot for Price Model", 
+       x = "Log Predicted Price", y = "Standardized Residual")
+```
+
+From our graph, we can see that there is a similar amount of positive and 
+negative residuals, which satisfies the linearity condition. The magnitude of 
+the residuals does seem to change a bit as price increases. However, this was 
+much more pronounced before we did the log transformation. As a result, the 
+constant variance condition is not completely satisfied, but we will proceed 
+with caution.
+
+
+
+```{r normality_check, warning = FALSE}
+resid_hist <- ggplot(data = AB_aug, aes(x = .std.resid)) +
+  geom_histogram(fill = "steelblue") +
+  labs(x = "Standardized Residuals", title = "Dist. of Residuals")
+resid_qq <- ggplot(data = AB_aug, aes(sample = .std.resid)) +
+  stat_qq(color = "steelblue") + 
+  stat_qq_line(color = "red") +
+  labs(title = "Normal QQ-plot of Std. Resid.")
+resid_hist + resid_qq
+```
+
+The normality condition is satisfied because the distribution of the 
+standardized residuals is approximately normal, seen in our histogram and in 
+our normal QQ plot. 
+
+
+## Result discussions
+
+Going into the analysis, we did not have too much of an idea of which variables 
+would be influential in predicting the prices of Airbnb's, except that we 
+thought that neighborhood_group and room_type would matter (which was correct).
+
+After looking at the results, most of the results were unsurprising. The base 
+room_type of entire apartment/home usually costs more than a single room, which
+usually costs more than a double room. The number of listings a host had 
+(calculated_host_listings_count) and the availability of the Airbnb 
+(availability_365) both had small but positive coefficients, showing that 
+as each of them increased generally the price would increase. We found that 
+the the order of boroughs for median predicted price of Airbnb's from most 
+expensive to least expensive is Manhattan, Brooklyn, Queens, Staten Island, 
+and Bronx, with Staten Island and Bronx being very similar. For the minimum 
+required nights, as minimum_nights increased price tended to decrease. This 
+makes sense because the more nights you have to pay for, the lower the price
+can be (similar to buying things in bulk). Finally, it seemed that the number 
+of reviews seemed to have a slight negative relationship with price. This did 
+not make much sense, because it would seem like a lot of reviews for a host 
+generally means a good Airbnb which can be priced higher. However, a lot of 
+reviews for an Airbnb means that many people were able to stay, meaning the 
+Airbnb might be in the more affordable range of prices rather than being one 
+of the more expensive ones. As a result, after further thought, this result 
+kind of makes sense as well. 
+
+We will use this model to create an RShiny app that allows users to enter in 
+the information about an Airbnb and our app will predict the  price. 
